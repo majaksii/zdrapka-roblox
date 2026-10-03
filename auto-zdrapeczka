@@ -1,0 +1,1162 @@
+--[[
+    BOTTLE FARMER — Place 109705629442658
+    - Pływające (draggable) GUI: START / STOP + suwaki prędkości tweena
+    - Zbiera WSZYSTKIE butelki z Workspace.Butelki tweenując się między nimi
+    - FireProximityPrompt TYLKO na butelkach, MASOWO, dopiero gdy gracz <= 2m od butelki
+    - Optymalizacja trasy: klastry gęstości (tam gdzie najwięcej) + greedy nearest-neighbour
+    - Render ścieżki: kropki + linie do ~40 kolejnych celów (tylko lokalnie, bez lagów)
+
+    Struktura z mapy (nie zgadywana):
+      Workspace.Butelki -> Model "Butelka" (x~250)
+        -> ProximityPrompt (direct child, "Zbierz Butelke", Hold 0.15, MaxDist 3.3-5, Enabled=false gdy LOD)
+        -> PrimaryPart + MeshParts (LOD/Detailed)
+      Prompt sterowany przez BottleClient (Detailed tylko <=50 studs i na ekranie),
+      dlatego skrypt sam włącza prompt tuż przed fireproximityprompt.
+]]
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local CoreGui = game:GetService("CoreGui")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local plr = Players.LocalPlayer
+if not plr then return end
+
+--// KONFIG (zmieniane suwakami) //--
+local CFG = {
+    Speed = 150,        -- studs/s (suwak 20..500) — tween, nie TP
+    Dwell = 0.08,       -- przerwa po zebraniu (suwak 0..0.5)
+    BurstR = 8,         -- masowy fire w promieniu (stała)
+    ArriveRadius = 2,   -- TWARDY warunek fire: gracz ≤2m od butelki
+    HoverH = 2.2,       -- wysokość dolotu nad butelką (suwak 1.5..4)
+    ClusterR = 30,      -- promień klastra gęstości (suwak 15..60)
+    SellEvery = 500,    -- auto-sprzedaż co N w plecaku (suwak 100..2000)
+    AutoSell = true,    -- jazda do Butelkomatu po przekroczeniu progu
+    SpecFirst = true,   -- NAJPIERW specjalne (Złota/Srebrna/...) wg wartości
+    ShowPath = true,    -- 2D render ścieżki
+    ClusterMode = true, -- zbieraj tam gdzie najwięcej
+    SCR_Tempo = 0.1,    -- przerwa między zdrapkami (suwak 0..1)
+    SCR_Limit = 100,    -- max zdrapek na sesję (suwak 10..500)
+    SCR_Buy = true,     -- kupuj gdy ekwipunek pusty
+    SCR_Card = "Siodemeczki", -- wybrana zdrapka (selektor na stronie ZDRAPKI)
+    AntiAFK = true,     -- anty-AFK (VirtualUser, jak w Infinite Yield)
+}
+
+local running = false
+local stopReq = false
+local busy = false
+local currentTween = nil
+local collectedTotal = 0
+local lastSellCount = 0 -- przy ilu zebranych była ostatnia sprzedaż
+
+-- zdrapki: BuyCard("Siodemeczki",1)=7 zł → UseCard(id) → CompleteScratch() (bez canvasu!)
+local SCR_R = ReplicatedStorage:WaitForChild("ScratchCardRemote")
+local scrRunning, scrBusy, scrErr = false, false, 0
+local scrStats = { n = 0, cost = 0, won = 0, big = 0 }
+
+--// HELPERS //--
+local function hrp()
+    local c = plr.Character
+    return c and c:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function hum()
+    local c = plr.Character
+    return c and c:FindFirstChildOfClass("Humanoid") or nil
+end
+
+-- anty-sit: wstań jeśli gracz usiadł na jakimś obiekcie (krzesło/butelkomat/itp.)
+-- UWAGA: Humanoid.Seated to EVENT (signal), bool to Humanoid.Sit!
+local function standUp()
+    local h = hum()
+    if h and h.Sit then
+        h.Sit = false
+        h.Jump = true
+    end
+end
+
+-- Ceny z BottleConfig (ReplicatedStorage) — priorytet = droższe najpierw.
+-- Klucze znormalizowane (bez polskich znaków), żeby refined match zawsze działał.
+local VALUES = {
+    normalna = 0.5, srebrna = 200, zlota = 500, diamentowa = 1000,
+    teczowa = 2500, galaktyczna = 5000, lsniaca = 10000,
+    toksyczna = 50000, antymaterialna = 100000,
+}
+local TYPECOLORS = {
+    normalna = { 90, 255, 150 }, srebrna = { 220, 225, 235 },
+    zlota = { 255, 200, 40 }, diamentowa = { 150, 220, 255 },
+    teczowa = { 255, 130, 220 }, galaktyczna = { 170, 90, 255 },
+    lsniaca = { 255, 255, 220 }, toksyczna = { 80, 255, 120 },
+    antymaterialna = { 200, 60, 255 },
+}
+local function norm(s)
+    -- łańcuch DOSŁOWNYCH 2-bajtowych sekwencji (działa na bajtach, bezpieczny w UTF-8)
+    s = tostring(s or "normalna"):lower()
+    s = s:gsub("ą", "a"):gsub("ć", "c"):gsub("ę", "e"):gsub("ł", "l"):gsub("ń", "n")
+    s = s:gsub("ó", "o"):gsub("ś", "s"):gsub("ź", "z"):gsub("ż", "z")
+    s = s:gsub("Ą", "a"):gsub("Ć", "c"):gsub("Ę", "e"):gsub("Ł", "l"):gsub("Ń", "n")
+    s = s:gsub("Ó", "o"):gsub("Ś", "s"):gsub("Ź", "z"):gsub("Ż", "z")
+    return s
+end
+
+local function bottlePos(model)
+    local ok, cf = pcall(function() return model:GetPivot() end)
+    if ok and cf then return cf.Position end
+    local pp = model:FindFirstChildWhichIsA("BasePart", true)
+    if pp then return pp.Position end
+    return nil
+end
+
+local function bottlePrompt(model)
+    -- prompt jest DIRECT child Modelu (wg .rbxlx), ale dajemy fallback rekurencyjny
+    local p = model:FindFirstChildOfClass("ProximityPrompt")
+    if p then return p end
+    return model:FindFirstChildWhichIsA("ProximityPrompt", true)
+end
+
+local function scanBottles()
+    local out = {}
+    local folder = Workspace:FindFirstChild("Butelki")
+    if not folder then return out end
+    for _, m in ipairs(folder:GetChildren()) do
+        if m:IsA("Model") and m.Name == "Butelka" then
+            local pos = bottlePos(m)
+            if pos then
+                local bt = nil
+                pcall(function() bt = m:GetAttribute("BottleType") end)
+                local nbt = norm(bt)
+                out[#out + 1] = {
+                    model = m, prompt = bottlePrompt(m), pos = pos,
+                    btype = nbt, value = VALUES[nbt] or 0.5,
+                }
+            end
+        end
+    end
+    return out
+end
+
+--// PLANOWANIE TRASY: gęstość + greedy NN (optymalne bez lagów) //--
+local function planRoute(bottles, fromPos)
+    local n = #bottles
+    if n == 0 then return {} end
+    if n == 1 then return { bottles[1] } end
+
+    -- PRIORYTET SPECJALNYCH: droższe butelki (Złota/Srebrna/...) ZAWSZE przed zwykłymi
+    if CFG.SpecFirst then
+        local sp, nm = {}, {}
+        for _, b in ipairs(bottles) do
+            if (b.value or 0.5) > 0.5 then sp[#sp + 1] = b else nm[#nm + 1] = b end
+        end
+        if #sp > 0 then
+            local function greedySP(list, start)
+                local remaining = {}
+                for _, v in ipairs(list) do remaining[#remaining + 1] = v end
+                local route, cur = {}, start
+                while #remaining > 0 do
+                    local bi, bd = 1, math.huge
+                    for i, b in ipairs(remaining) do
+                        local d = (cur - b.pos).Magnitude
+                        if d < bd then bd, bi = d, i end
+                    end
+                    local pick = table.remove(remaining, bi)
+                    route[#route + 1] = pick
+                    cur = pick.pos
+                end
+                return route
+            end
+            local r1 = greedySP(sp, fromPos)
+            local ts = r1[#r1].pos
+            for _, v in ipairs(greedySP(nm, ts)) do r1[#r1 + 1] = v end
+            return r1
+        end
+    end
+
+    local orderPool = bottles
+
+    if CFG.ClusterMode and n > 4 then
+        -- 1) grid-hash: zlicz sąsiadów w promieniu ClusterR (szybciej niż O(n^2) pełne dla 250)
+        local R = CFG.ClusterR
+        local cell = math.max(R, 10)
+        local buckets = {}
+        local function key(p)
+            return math.floor(p.X / cell) .. "," .. math.floor(p.Z / cell)
+        end
+        for _, b in ipairs(bottles) do
+            local k = key(b.pos)
+            local t = buckets[k]
+            if not t then t = {}; buckets[k] = t end
+            t[#t + 1] = b
+        end
+        -- 2) znajdź najgęstszy punkt (najwięcej sąsiadów w R)
+        local best, bestCount = nil, -1
+        local R2 = R * R
+        for _, b in ipairs(bottles) do
+            local cnt = 0
+            local cx, cz = math.floor(b.pos.X / cell), math.floor(b.pos.Z / cell)
+            for dx = -1, 1 do
+                for dz = -1, 1 do
+                    local t = buckets[(cx + dx) .. "," .. (cz + dz)]
+                    if t then
+                        for _, o in ipairs(t) do
+                            local d = b.pos - o.pos
+                            if (d.X * d.X + d.Z * d.Z) <= R2 then cnt = cnt + 1 end
+                        end
+                    end
+                end
+            end
+            if cnt > bestCount then bestCount, best = cnt, b end
+        end
+        -- 3) klaster = wszystko w R*1.4 od best; reszta = reszta mapy
+        if best and bestCount >= 3 then
+            local cluster, rest = {}, {}
+            local RR = (R * 1.4) ^ 2
+            for _, b in ipairs(bottles) do
+                local d = b.pos - best.pos
+                if (d.X * d.X + d.Z * d.Z) <= RR then cluster[#cluster + 1] = b
+                else rest[#rest + 1] = b end
+            end
+            -- greedy NN wewnątrz klastra od gracza, potem reszta od końca klastra
+            local function greedyNN(list, start)
+                local remaining = {}
+                for _, v in ipairs(list) do remaining[#remaining + 1] = v end
+                local route, cur = {}, start
+                while #remaining > 0 do
+                    local bi, bd = 1, math.huge
+                    for i, b in ipairs(remaining) do
+                        local d = (cur - b.pos).Magnitude
+                        if d < bd then bd, bi = d, i end
+                    end
+                    local pick = table.remove(remaining, bi)
+                    route[#route + 1] = pick
+                    cur = pick.pos
+                end
+                return route
+            end
+            local r1 = greedyNN(cluster, fromPos)
+            local tailStart = (#r1 > 0) and r1[#r1].pos or fromPos
+            local r2 = greedyNN(rest, tailStart)
+            for _, v in ipairs(r2) do r1[#r1 + 1] = v end
+            return r1
+        end
+    end
+
+    -- fallback: globalny greedy NN od gracza
+    local remaining = {}
+    for _, v in ipairs(orderPool) do remaining[#remaining + 1] = v end
+    local route, cur = {}, fromPos
+    while #remaining > 0 do
+        local bi, bd = 1, math.huge
+        for i, b in ipairs(remaining) do
+            local d = (cur - b.pos).Magnitude
+            if d < bd then bd, bi = d, i end
+        end
+        local pick = table.remove(remaining, bi)
+        route[#route + 1] = pick
+        cur = pick.pos
+    end
+    return route
+end
+
+--// TWEEN (płynny dolot; serwer widzi replikowaną pozycję i akceptuje prompt) //--
+local function tweenTo(targetPos)
+    local h = hrp()
+    if not h then return end
+    if currentTween then pcall(function() currentTween:Cancel() end); currentTween = nil end
+    local dist = (h.Position - targetPos).Magnitude
+    if dist < 0.5 then return end
+    local dur = math.clamp(dist / math.max(CFG.Speed, 1), 0.03, 6)
+    local tw = TweenService:Create(h, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = CFrame.new(targetPos) })
+    currentTween = tw
+    tw:Play()
+    tw.Completed:Wait()
+    if currentTween == tw then currentTween = nil end
+    standUp()
+end
+
+--// MASOWY FIRE, ale TYLKO gdy gracz <= ArriveRadius (2m) od butelki //--
+local fireFn = (typeof(fireproximityprompt) == "function") and fireproximityprompt or nil
+
+local function fireSingle(prompt)
+    if not prompt or not prompt.Parent then return false end
+    -- BottleClient ustawia Enabled=false poza Detailed — włączamy na chwilę
+    pcall(function()
+        prompt.Enabled = true
+        prompt.RequiresLineOfSight = false
+        if prompt.MaxActivationDistance < 4 then prompt.MaxActivationDistance = 5 end
+    end)
+    if fireFn then
+        local ok = pcall(function() fireFn(prompt) end)
+        return ok
+    else
+        -- fallback gdyby executor nie miał fireproximityprompt
+        pcall(function()
+            prompt:InputHoldBegin()
+            task.wait(prompt.HoldDuration + 0.05)
+            prompt:InputHoldEnd()
+        end)
+        return true
+    end
+end
+
+--// ZBIÓR (sprawdzony wariant: fire + burst + krótkie waity na rejestrację) //--
+local function tryCollect(entry)
+    local h = hrp()
+    if not h or not entry.model.Parent then return false end
+    -- TWARDY WARUNEK: gracz musi być w <= ArriveRadius (2m)
+    if (h.Position - entry.pos).Magnitude > CFG.ArriveRadius + 0.6 then return false end
+    local before = entry.model.Parent
+    if entry.prompt then fireSingle(entry.prompt) end
+    task.wait(0.08)
+    -- MASOWO: dobij wszystko w BurstR (też tylko te blisko gracza)
+    local folder = Workspace:FindFirstChild("Butelki")
+    if folder then
+        local hh = hrp()
+        local hp = hh and hh.Position
+        if hp then
+            local burst = 0
+            for _, m in ipairs(folder:GetChildren()) do
+                if burst >= 8 then break end
+                if m:IsA("Model") and m.Name == "Butelka" and m ~= entry.model then
+                    local pp = bottlePos(m)
+                    if pp and (hp - pp).Magnitude <= CFG.BurstR then
+                        local pr = bottlePrompt(m)
+                        if pr then fireSingle(pr); burst = burst + 1 end
+                    end
+                end
+            end
+        end
+    end
+    task.wait(0.05)
+    -- zebrana = model znika z Butelki (serwer usuwa po podniesieniu)
+    if not entry.model.Parent or entry.model.Parent ~= before then
+        collectedTotal = collectedTotal + 1
+        return true
+    end
+    return false
+end
+
+--// BUTELKOMAT — liczenie i wyszukiwanie prompta sprzedaży //--
+local function countTools()
+    local n = 0
+    local bp = plr:FindFirstChild("Backpack")
+    if bp then
+        for _, t in ipairs(bp:GetChildren()) do
+            if t:IsA("Tool") and t:GetAttribute("BottleType") ~= nil then n = n + 1 end
+        end
+    end
+    local ch = plr.Character
+    if ch then
+        for _, t in ipairs(ch:GetChildren()) do
+            if t:IsA("Tool") and t:GetAttribute("BottleType") ~= nil then n = n + 1 end
+        end
+    end
+    return n
+end
+
+-- grupowy ("...wszystkie...") sprzedaje hurtem; fallback = pierwszy prompt maszyny
+local function findSellPrompt()
+    local bm = Workspace:FindFirstChild("Butelkomat")
+    if not bm then return nil, nil end
+    local pos = nil
+    pcall(function() pos = bm:GetPivot().Position end)
+    local best = nil
+    for _, d in ipairs(bm:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            if d.ActionText and d.ActionText:find("wszystkie") then return d, pos end
+            best = best or d
+        end
+    end
+    return best, pos
+end
+
+--// RENDER 2D ŚCIEŻKI — kropki na ekranie.
+--// Każda kropka ZNIKA jak ją dotkniesz (≤3m) albo jak butelka zostanie zebrana.
+--// Overlay nie blokuje klików (Active=false). Odświeżanie co klatkę (40 kropek = grosze).
+local curRoute = {}
+
+local function hidePath()
+    curRoute = {}
+end
+
+local function drawPath(points)
+    curRoute = {}
+    for i = 1, math.min(#points, 40) do
+        if points[i].model.Parent then curRoute[#curRoute + 1] = points[i] end
+    end
+end
+
+local pathDots = {}
+local function initPathOverlay(parentGui)
+    -- posprzątaj starocie 3D po poprzednich wersjach
+    local junk = Workspace:FindFirstChild("_BottlePath")
+    if junk then pcall(function() junk:Destroy() end) end
+    if getgenv().BF_RS then pcall(function() getgenv().BF_RS:Disconnect() end) end
+
+    local ov = Instance.new("Frame")
+    ov.Name = "_Path2D"
+    ov.Size = UDim2.new(1, 0, 1, 0)
+    ov.BackgroundTransparency = 1
+    ov.Active = false
+    ov.ZIndex = 1
+    ov.Parent = parentGui
+
+    for i = 1, 40 do
+        local d = Instance.new("Frame")
+        d.Size = UDim2.fromOffset(10, 10)
+        d.Visible = false
+        d.Active = false
+        d.BackgroundColor3 = Color3.fromRGB(90, 255, 150)
+        d.BorderSizePixel = 0
+        d.ZIndex = 2
+        d.Parent = ov
+        local u = Instance.new("UICorner")
+        u.CornerRadius = UDim.new(1, 0)
+        u.Parent = d
+        pathDots[i] = d
+    end
+
+    getgenv().BF_RS = RunService.RenderStepped:Connect(function()
+        local cam = Workspace.CurrentCamera
+        local h = hrp()
+        if not CFG.ShowPath or not running or not h or not cam then
+            for _, d in ipairs(pathDots) do d.Visible = false end
+            return
+        end
+        local n = 0
+        for i, wp in ipairs(curRoute) do
+            if n >= 40 then break end
+            if wp.model.Parent then
+                local sp, onScr = cam:WorldToViewportPoint(wp.pos + Vector3.new(0, 2.5, 0))
+                if onScr and (h.Position - wp.pos).Magnitude > 3 then
+                    n = n + 1
+                    local d = pathDots[n]
+                    d.Position = UDim2.fromOffset(sp.X - 5, sp.Y - 5)
+                    -- kolor = TYP butelki (specjalne widać z daleka), rozmiar = priorytet w trasie
+                    local cc = TYPECOLORS[wp.btype] or TYPECOLORS.normalna
+                    if i == 1 then
+                        d.Size = UDim2.fromOffset(14, 14)
+                        d.BackgroundColor3 = Color3.fromRGB(255, 220, 80)
+                    else
+                        d.Size = UDim2.fromOffset(10, 10)
+                        d.BackgroundColor3 = Color3.fromRGB(cc[1], cc[2], cc[3])
+                    end
+                    d.Visible = true
+                end
+            end
+        end
+        for j = n + 1, 40 do pathDots[j].Visible = false end
+    end)
+end
+
+--// GUI (pływające, draggable) //--
+local old = CoreGui:FindFirstChild("BottleFarmerGui")
+if old then pcall(function() old:Destroy() end) end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "BottleFarmerGui"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = CoreGui
+
+local root = Instance.new("Frame")
+root.Size = UDim2.fromOffset(330, 540)
+root.Position = UDim2.fromOffset(30, 110)
+root.BackgroundColor3 = Color3.fromRGB(16, 18, 24)
+root.Active = true
+root.Draggable = true -- pływające: można ciągać po ekranie
+root.Parent = gui
+Instance.new("UICorner", root).CornerRadius = UDim.new(0, 12)
+local rs = Instance.new("UIStroke", root)
+rs.Color = Color3.fromRGB(70, 90, 140); rs.Transparency = 0.3
+
+local function txt(parent, s, size, col, bold)
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.Size = UDim2.new(1, 0, 0, size)
+    l.Font = bold and Enum.Font.GothamBold or Enum.Font.GothamMedium
+    l.TextSize = size - 2
+    l.TextColor3 = col or Color3.fromRGB(235, 238, 245)
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Text = s
+    l.Parent = parent
+    return l
+end
+
+local title = txt(root, "  🍾 BOTTLE FARMER v8", 26, Color3.fromRGB(255, 255, 255), true)
+title.Position = UDim2.fromOffset(8, 6)
+local sub = txt(root, "  Place 109705629442658  •  tween + fire w 2m + auto-sell", 16, Color3.fromRGB(140, 148, 165), false)
+sub.Position = UDim2.fromOffset(8, 30)
+
+local closeB = Instance.new("TextButton")
+closeB.Size = UDim2.fromOffset(28, 28); closeB.Position = UDim2.new(1, -36, 0, 8)
+closeB.BackgroundColor3 = Color3.fromRGB(50, 55, 70); closeB.Text = "X"
+closeB.Font = Enum.Font.GothamBold; closeB.TextSize = 14
+closeB.TextColor3 = Color3.fromRGB(200, 205, 220); closeB.Parent = root
+Instance.new("UICorner", closeB).CornerRadius = UDim.new(0, 8)
+
+initPathOverlay(gui) -- 2D render ścieżki (kropki znikają po dotknięciu)
+
+local status = txt(root, "  Gotowy", 18, Color3.fromRGB(140, 148, 165), false)
+status.Position = UDim2.fromOffset(8, 48); status.Size = UDim2.new(1, -16, 0, 18)
+local count = txt(root, "  Butelki: -", 18, Color3.fromRGB(90, 200, 255), false)
+count.Position = UDim2.fromOffset(8, 66); count.Size = UDim2.new(1, -16, 0, 18)
+
+local startB = Instance.new("TextButton")
+startB.Size = UDim2.new(0.5, -12, 0, 36); startB.Position = UDim2.fromOffset(8, 88)
+startB.BackgroundColor3 = Color3.fromRGB(45, 160, 90); startB.Text = "START"
+startB.Font = Enum.Font.GothamBold; startB.TextSize = 14; startB.TextColor3 = Color3.new(1, 1, 1)
+startB.Parent = root
+Instance.new("UICorner", startB).CornerRadius = UDim.new(0, 9)
+
+local stopB = Instance.new("TextButton")
+stopB.Size = UDim2.new(0.5, -12, 0, 36); stopB.Position = UDim2.new(0.5, 4, 0, 88)
+stopB.BackgroundColor3 = Color3.fromRGB(190, 70, 70); stopB.Text = "STOP"
+stopB.Font = Enum.Font.GothamBold; stopB.TextSize = 14; stopB.TextColor3 = Color3.new(1, 1, 1)
+stopB.Parent = root
+Instance.new("UICorner", stopB).CornerRadius = UDim.new(0, 9)
+
+-- ZAKŁADKI: FARMA / ZDRAPKI (przełączają widoczność kontrolek; START/STOP farmy zawsze na wierzchu)
+local farmaCtrls, zdrapCtrls = {}, {}
+local curList = farmaCtrls
+local tabFar, tabZdr = nil, nil
+local function setTab(which)
+    for _, c in ipairs(farmaCtrls) do pcall(function() c.Visible = (which == "farma") end) end
+    for _, c in ipairs(zdrapCtrls) do pcall(function() c.Visible = (which == "zdrap") end) end
+    if tabFar then
+        tabFar.BackgroundColor3 = (which == "farma") and Color3.fromRGB(50, 110, 190) or Color3.fromRGB(36, 40, 52)
+        tabZdr.BackgroundColor3 = (which == "zdrap") and Color3.fromRGB(50, 110, 190) or Color3.fromRGB(36, 40, 52)
+    end
+end
+tabFar = Instance.new("TextButton")
+tabFar.Size = UDim2.new(0.5, -12, 0, 28); tabFar.Position = UDim2.fromOffset(8, 128)
+tabFar.BackgroundColor3 = Color3.fromRGB(50, 110, 190); tabFar.Text = "FARMA"
+tabFar.Font = Enum.Font.GothamBold; tabFar.TextSize = 13
+tabFar.TextColor3 = Color3.new(1, 1, 1); tabFar.Parent = root
+Instance.new("UICorner", tabFar).CornerRadius = UDim.new(0, 7)
+tabZdr = Instance.new("TextButton")
+tabZdr.Size = UDim2.new(0.5, -12, 0, 28); tabZdr.Position = UDim2.new(0.5, 4, 0, 128)
+tabZdr.BackgroundColor3 = Color3.fromRGB(36, 40, 52); tabZdr.Text = "ZDRAPKI"
+tabZdr.Font = Enum.Font.GothamBold; tabZdr.TextSize = 13
+tabZdr.TextColor3 = Color3.new(1, 1, 1); tabZdr.Parent = root
+Instance.new("UICorner", tabZdr).CornerRadius = UDim.new(0, 7)
+tabFar.MouseButton1Click:Connect(function() setTab("farma") end)
+tabZdr.MouseButton1Click:Connect(function() setTab("zdrap") end)
+
+-- suwaki: wiersz opis + wiersz [-] [wartość] [+] (trafiają na aktualną zakładkę)
+local sliderY = 160
+local function addSlider(labelText, min, max, step, get, set, fmt)
+    local y = sliderY; sliderY = sliderY + 52
+    local titleLbl = txt(root, "  " .. labelText, 16, Color3.fromRGB(220, 225, 235), false)
+    titleLbl.Position = UDim2.fromOffset(8, y)
+    local val = txt(root, "", 16, Color3.fromRGB(90, 200, 255), true)
+    val.Position = UDim2.new(0, 8, 0, y + 15); val.Size = UDim2.new(1, -16, 0, 15)
+    val.TextXAlignment = Enum.TextXAlignment.Center
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -16, 0, 20); row.Position = UDim2.fromOffset(8, y + 31)
+    row.BackgroundTransparency = 1; row.Parent = root
+    local function btn(t, x)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.fromOffset(52, 20); b.Position = UDim2.fromOffset(x, 0)
+        b.BackgroundColor3 = Color3.fromRGB(40, 45, 58); b.Text = t
+        b.Font = Enum.Font.GothamBold; b.TextSize = 14
+        b.TextColor3 = Color3.new(1, 1, 1); b.Parent = row
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+        return b
+    end
+    local m = btn("- -", 0)
+    local p = btn("+", 262 - 52)
+    local function refresh() val.Text = "  " .. fmt(get()) end
+    m.MouseButton1Click:Connect(function() set(math.clamp(get() - step, min, max)); refresh() end)
+    p.MouseButton1Click:Connect(function() set(math.clamp(get() + step, min, max)); refresh() end)
+    refresh()
+    for _, o in ipairs({ titleLbl, val, row }) do curList[#curList + 1] = o end
+    return refresh
+end
+
+addSlider("Szybkość tween (studs/s)", 20, 500, 10,
+    function() return CFG.Speed end, function(v) CFG.Speed = math.floor(v) end,
+    function(v) return "SPEED: " .. tostring(math.floor(v)) end)
+addSlider("Przerwa po zebraniu (s)", 0, 0.5, 0.02,
+    function() return CFG.Dwell end, function(v) CFG.Dwell = v end,
+    function(v) return string.format("DWELL: %.2f s", v) end)
+addSlider("Promień klastra gęstości", 15, 60, 5,
+    function() return CFG.ClusterR end, function(v) CFG.ClusterR = v end,
+    function(v) return "KLASTER: " .. tostring(math.floor(v)) .. " studs" end)
+addSlider("Wysokość nad butelką", 1.5, 4, 0.2,
+    function() return CFG.HoverH end, function(v) CFG.HoverH = v end,
+    function(v) return string.format("HOVER: %.1f (dobicie ≤ %.1fm)", v, CFG.ArriveRadius) end)
+addSlider("Sprzedaż co N butelek", 100, 2000, 50,
+    function() return CFG.SellEvery end, function(v) CFG.SellEvery = math.floor(v) end,
+    function(v) return "SELL: co " .. tostring(math.floor(v)) end)
+
+local function addToggle(labelText, y, get, set)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, -16, 0, 26); b.Position = UDim2.fromOffset(8, y)
+    b.Font = Enum.Font.GothamSemibold; b.TextSize = 12; b.Parent = root
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 7)
+    local function refresh()
+        local on = get()
+        b.Text = (on and "✓ " or "○ ") .. labelText
+        b.BackgroundColor3 = on and Color3.fromRGB(50, 110, 190) or Color3.fromRGB(36, 40, 52)
+        b.TextColor3 = Color3.new(1, 1, 1)
+    end
+    b.MouseButton1Click:Connect(function() set(not get()); refresh(); hidePath() end)
+    refresh()
+    curList[#curList + 1] = b
+end
+addToggle("Pokaż ścieżkę 2D", 426, function() return CFG.ShowPath end, function(v) CFG.ShowPath = v end)
+addToggle("Zbieraj tam gdzie najwięcej (klastry)", 452, function() return CFG.ClusterMode end, function(v) CFG.ClusterMode = v end)
+addToggle("Auto-sprzedaż do Butelkomatu", 478, function() return CFG.AutoSell end, function(v) CFG.AutoSell = v end)
+addToggle("Specjalne najpierw (wartość)", 504, function() return CFG.SpecFirst end, function(v) CFG.SpecFirst = v end)
+
+--// STRONA ZDRAPKI (Siódemeczki 7 zł, auto drapanie bez canvasu) //--
+curList = zdrapCtrls
+scrStatLbl = txt(root, "  Karty: 0", 16, Color3.fromRGB(220, 225, 235), true)
+scrStatLbl.Position = UDim2.fromOffset(8, 160); scrStatLbl.Size = UDim2.new(1, -16, 0, 34)
+scrStatLbl.TextWrapped = true
+scrLastLbl = txt(root, "  Ostatnia: -", 14, Color3.fromRGB(140, 148, 165), false)
+scrLastLbl.Position = UDim2.fromOffset(8, 196); scrLastLbl.Size = UDim2.new(1, -16, 0, 16)
+scrKasaLbl = txt(root, "  Kasa: ?", 14, Color3.fromRGB(120, 220, 130), true)
+scrKasaLbl.Position = UDim2.fromOffset(8, 212); scrKasaLbl.Size = UDim2.new(1, -16, 0, 16)
+for _, o in ipairs({ scrStatLbl, scrLastLbl, scrKasaLbl }) do curList[#curList + 1] = o end
+sliderY = 232
+addSlider("Tempo (przerwa/kartę)", 0, 1, 0.05,
+    function() return CFG.SCR_Tempo end, function(v) CFG.SCR_Tempo = v end,
+    function(v) return string.format("TEMPO: %.2f s", v) end)
+addSlider("Limit kart na sesję", 10, 500, 10,
+    function() return CFG.SCR_Limit end, function(v) CFG.SCR_Limit = math.floor(v) end,
+    function(v) return "LIMIT: " .. tostring(math.floor(v)) end)
+local scrStart = Instance.new("TextButton")
+scrStart.Size = UDim2.new(0.5, -12, 0, 36); scrStart.Position = UDim2.fromOffset(8, 348)
+scrStart.BackgroundColor3 = Color3.fromRGB(45, 160, 90); scrStart.Text = "START ZDRAPKI"
+scrStart.Font = Enum.Font.GothamBold; scrStart.TextSize = 13
+scrStart.TextColor3 = Color3.new(1, 1, 1); scrStart.Parent = root
+Instance.new("UICorner", scrStart).CornerRadius = UDim.new(0, 9)
+local scrStop = Instance.new("TextButton")
+scrStop.Size = UDim2.new(0.5, -12, 0, 36); scrStop.Position = UDim2.new(0.5, 4, 0, 348)
+scrStop.BackgroundColor3 = Color3.fromRGB(190, 70, 70); scrStop.Text = "STOP"
+scrStop.Font = Enum.Font.GothamBold; scrStop.TextSize = 13
+scrStop.TextColor3 = Color3.new(1, 1, 1); scrStop.Parent = root
+Instance.new("UICorner", scrStop).CornerRadius = UDim.new(0, 9)
+for _, o in ipairs({ scrStart, scrStop }) do curList[#curList + 1] = o end
+scrStart.MouseButton1Click:Connect(function()
+    if scrRunning then return end
+    scrRunning = true
+    task.spawn(scratchLoop)
+end)
+scrStop.MouseButton1Click:Connect(function() scrRunning = false end)
+addToggle("Kupuj zdrapki gdy brak w eq", 392, function() return CFG.SCR_Buy end, function(v) CFG.SCR_Buy = v end)
+
+-- selektor zdrapki: [◀] nazwa (cena) [▶] — pętla czyta CFG.SCR_Card na bieżąco
+local cardLbl = txt(root, "  [1/35] ?", 15, Color3.fromRGB(255, 220, 130), true)
+cardLbl.Position = UDim2.fromOffset(46, 424); cardLbl.Size = UDim2.new(1, -100, 0, 26)
+local function refreshCard()
+    if cardLbl then
+        cardLbl.Text = "  [" .. CARDI .. "/" .. #CARDS .. "] " .. cardDispName(CFG.SCR_Card)
+    end
+end
+local function cardBtn(t, x)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(38, 26); b.Position = UDim2.fromOffset(x, 424)
+    b.BackgroundColor3 = Color3.fromRGB(40, 45, 58); b.Text = t
+    b.Font = Enum.Font.GothamBold; b.TextSize = 15
+    b.TextColor3 = Color3.new(1, 1, 1); b.Parent = root
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    curList[#curList + 1] = b
+    return b
+end
+local cardPrev = cardBtn("◀", 8)
+local cardNext = cardBtn("▶", 0)
+cardNext.Position = UDim2.new(1, -46, 0, 424)
+curList[#curList + 1] = cardLbl
+cardPrev.MouseButton1Click:Connect(function()
+    CARDI = ((CARDI - 2) % #CARDS) + 1
+    CFG.SCR_Card = CARDS[CARDI]
+    refreshCard()
+end)
+cardNext.MouseButton1Click:Connect(function()
+    CARDI = (CARDI % #CARDS) + 1
+    CFG.SCR_Card = CARDS[CARDI]
+    refreshCard()
+end)
+refreshCard()
+
+-- ANTI-AFK (metoda Infinite Yield: VirtualUser klika co idle-kick)
+local antiConn = nil
+local function setAntiAFK(on)
+    if on and not antiConn then
+        antiConn = plr.Idled:Connect(function()
+            pcall(function()
+                local vu = game:GetService("VirtualUser")
+                if vu.CaptureController then vu:CaptureController() end
+                vu:ClickButton2(Vector2.new())
+            end)
+        end)
+    elseif not on and antiConn then
+        antiConn:Disconnect()
+        antiConn = nil
+    end
+end
+addToggle("Anti-AFK (anty-kick)", 456, function() return CFG.AntiAFK end,
+    function(v) CFG.AntiAFK = v setAntiAFK(v) end)
+if CFG.AntiAFK then setAntiAFK(true) end
+
+-- cały Infinite Yield (admin) na życzenie — ciężki, ładuj tylko jak chcesz
+local iyBtn = Instance.new("TextButton")
+iyBtn.Size = UDim2.new(1, -16, 0, 26); iyBtn.Position = UDim2.fromOffset(8, 486)
+iyBtn.BackgroundColor3 = Color3.fromRGB(36, 40, 52); iyBtn.Text = "INFINITE YIELD (loader)"
+iyBtn.Font = Enum.Font.GothamSemibold; iyBtn.TextSize = 12
+iyBtn.TextColor3 = Color3.new(1, 1, 1); iyBtn.Parent = root
+Instance.new("UICorner", iyBtn).CornerRadius = UDim.new(0, 7)
+curList[#curList + 1] = iyBtn
+iyBtn.MouseButton1Click:Connect(function()
+    iyBtn.Text = "LADOWANIE IY..."
+    task.spawn(function()
+        local ok = pcall(function()
+            local src = game:HttpGet("https://raw.githubusercontent.com/DarkNetworks/Infinite-Yield/main/latest.lua")
+            loadstring(src)()
+        end)
+        iyBtn.Text = ok and "IY: ZALADOWANE" or "IY: BLAD (brak http?)"
+    end)
+end)
+
+setTab("farma")
+refreshScr()
+
+local function setStatus(t, col)
+    status.Text = "  " .. t
+    status.TextColor3 = col or Color3.fromRGB(140, 148, 165)
+end
+
+--// NOCLIP + ANTY-SIT podczas farmy (TP nie haczy, a jak usiądziesz to wstajesz) //--
+local noclipConn = nil
+local function setNoclip(on)
+    if on and not noclipConn then
+        noclipConn = RunService.Stepped:Connect(function()
+            if not running then return end
+            local c = plr.Character
+            if c then
+                for _, p in ipairs(c:GetDescendants()) do
+                    if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+                        p.CanCollide = false
+                    end
+                end
+            end
+            standUp() -- watchdog: usiadłeś na krześle/butelkomacie? wstań od razu
+        end)
+    elseif not on and noclipConn then
+        noclipConn:Disconnect(); noclipConn = nil
+    end
+end
+
+--// AUTO-SPRZEDAŻ: jazda do Butelkomatu, sprzedaż hurtem, powrót na pole //--
+local function goSell()
+    local h0 = hrp()
+    if not h0 then return end
+    if countTools() == 0 then
+        lastSellCount = collectedTotal -- nie ma czego sprzedawać, nie jedź
+        return
+    end
+    local back = h0.Position
+    local pr, mp = findSellPrompt()
+    if not pr or not mp then
+        setStatus("Brak Butelkomatu!", Color3.fromRGB(255, 120, 120))
+        return
+    end
+    setStatus("Jadę sprzedać (+" .. (collectedTotal - lastSellCount) .. ")...", Color3.fromRGB(255, 170, 70))
+    pcall(tweenTo, mp + Vector3.new(0, 3, 4)) -- stajesz ~5m od maszyny (prompt ma 7-8m)
+    standUp()
+    -- 1) hurtem grupowym (zwykle czyści wszystko na raz)
+    for _ = 1, 2 do
+        if countTools() == 0 then break end
+        fireSingle(pr)
+        task.wait(1.0)
+    end
+    -- 2) fallback pojedynczo (max 25, żeby nie utknąć)
+    local guard = 0
+    while countTools() > 0 and guard < 25 and running and not stopReq do
+        guard = guard + 1
+        local ch = plr.Character
+        local hu = ch and ch:FindFirstChildOfClass("Humanoid")
+        local bp = plr:FindFirstChild("Backpack")
+        local tool = nil
+        if bp then
+            for _, t in ipairs(bp:GetChildren()) do
+                if t:IsA("Tool") and t:GetAttribute("BottleType") ~= nil then tool = t break end
+            end
+        end
+        if tool and hu then
+            pcall(function() hu:EquipTool(tool) end)
+            task.wait(0.3)
+        end
+        local bm = Workspace:FindFirstChild("Butelkomat")
+        local single = nil
+        if bm then
+            for _, d in ipairs(bm:GetDescendants()) do
+                if d:IsA("ProximityPrompt") and d.Parent.Name == "prompt" then single = d break end
+            end
+        end
+        if single then fireSingle(single) end
+        task.wait(0.4)
+    end
+    lastSellCount = collectedTotal
+    setStatus("Sprzedane (" .. countTools() .. " zostało), wracam...", Color3.fromRGB(120, 220, 130))
+    pcall(tweenTo, back)
+end
+
+--// AUTO-ZDRAPKA "Siódemeczki" — najszybciej jak się da (bez canvasu).
+--// Mechanika gry: drapanie to tylko animacja; serwer rozlicza przy CompleteScratch.
+--// Cykl: BuyCard(-7 zł) → UseCard(id z inventory) → CompleteScratch() → kasa.
+local scrStatLbl, scrLastLbl, scrKasaLbl = nil, nil, nil
+local scrInvN = 0 -- ile wybranej zdrapki w ekwipunku (odświeżane co cykl)
+
+-- WSZYSTKIE zdrapki ze sklepu, po cenie rosnąco (klucze z ScratchCardConfig).
+-- Nazwy/ceny brane na żywo z configu (cardDispName/cardCost), tu tylko kolejność.
+local CARDS = {
+    "Siodemeczki", "SlodkaKicia", "Scratchemon", "SzopZlodziej", "KochanyKosmita",
+    "SlodkiPiesio", "PolskiPingwin", "Emotki", "Szescdziesiona", "Minescratch",
+    "CapybaraNumbers", "OlympusGold", "SlodkiChomiczek", "KawaiiSushi", "Osaka",
+    "SlodkaZabcia", "Plakal", "HotPepper", "SmiesznySzczurek", "KawaNaLawe",
+    "Piraci", "Akihabara", "BabkuSzokoladku", "SuperMariusz", "MiBombaclat",
+    "Pizza", "SlodkiKangurek", "KonieWalenie", "JadaNaRyby", "LuckyClover",
+    "Samurai", "GoldGoldGold", "DzienKota", "KonieWalenie2077", "RichBilionier",
+}
+local CARDI = 1
+local COSTC = {}
+
+local function cardCfg(k)
+    local ok, t = pcall(function()
+        return require(ReplicatedStorage:WaitForChild("ScratchCards"):WaitForChild("ScratchCardConfig")).CardTypes[k]
+    end)
+    if ok and type(t) == "table" then return t end
+    return nil
+end
+
+local function cardCost(k)
+    if COSTC[k] then return COSTC[k] end
+    local t = cardCfg(k)
+    local c = (t and tonumber(t.Cost)) or 7
+    COSTC[k] = c
+    return c
+end
+
+local function cardDispName(k)
+    local t = cardCfg(k)
+    if t and t.Name then return tostring(t.Name) .. " (" .. tostring(cardCost(k)) .. " zł)" end
+    return tostring(k)
+end
+
+local function refreshScr(note)
+    local p = scrStats.won - scrStats.cost
+    if scrStatLbl then
+        scrStatLbl.Text = "  Karty: " .. scrStats.n .. "  •  W eq: " .. scrInvN
+            .. "  •  Profit: " .. (p >= 0 and "+" or "") .. p
+            .. " (koszt " .. scrStats.cost .. " / wygrane " .. scrStats.won .. ")"
+    end
+    if scrLastLbl then scrLastLbl.Text = "  Ostatnia: " .. (note or "-") end
+    if scrKasaLbl then
+        local ls = plr:FindFirstChild("leaderstats")
+        local k = ls and ls:FindFirstChild("Kasa")
+        scrKasaLbl.Text = "  Kasa: " .. tostring(k and k.Value or "?")
+    end
+end
+
+local function scrInvList()
+    local key = CFG.SCR_Card
+    local okI, inv = pcall(function() return SCR_R:InvokeServer("GetInventory") end)
+    local list = {}
+    if okI and inv and inv.Success and inv.Inventory then
+        for i = #inv.Inventory, 1, -1 do
+            if inv.Inventory[i].CardType == key then list[#list + 1] = inv.Inventory[i].Id end
+        end
+    end
+    return list
+end
+
+-- InvokeServer z TIMEOUTEM (serwer potrafi zawiesić odpowiedź, np. throttle kupna).
+-- Porzucone wywołanie i tak kiedyś dojdzie (karta wyląduje w eq i weźmie ją refill).
+local function invokeT(fn, secs)
+    local done, res = false, nil
+    task.spawn(function()
+        res = { pcall(fn) }
+        done = true
+    end)
+    local t0 = os.clock()
+    while not done and os.clock() - t0 < (secs or 8) do task.wait(0.05) end
+    if not done then return false, "timeout" end
+    return table.unpack(res)
+end
+
+-- Cache ID: inventory TYLKO gdy może coś być (flaga scrNoStock); kupno POJEDYNCZE.
+-- BuyCard zwraca CardId, więc po kupnie nie trzeba odpytywać inventory.
+local scrIDCache, scrCacheKey, scrNoStock = {}, nil, false
+
+local function scrRefill()
+    local key = CFG.SCR_Card
+    if scrCacheKey ~= key then scrIDCache, scrCacheKey, scrNoStock = {}, key, false end
+    if #scrIDCache == 0 and not scrNoStock then
+        for _, id in ipairs(scrInvList()) do scrIDCache[#scrIDCache + 1] = id end
+        if #scrIDCache == 0 then scrNoStock = true end -- pusto: dalej prosto do sklepu
+    end
+    if #scrIDCache == 0 and CFG.SCR_Buy then
+        local okB, br = invokeT(function() return SCR_R:InvokeServer("BuyCard", key, 1) end, 8)
+        if okB and br and br.Success and br.CardId then
+            scrIDCache[#scrIDCache + 1] = br.CardId
+            scrStats.cost = scrStats.cost + cardCost(key)
+        elseif br == "timeout" then
+            return false, "timeout"
+        else
+            return false, "buy:" .. tostring(br and br.Error or "brak kasy?")
+        end
+    end
+    scrInvN = #scrIDCache
+    if #scrIDCache == 0 then return false, "pusto (sklep OFF)" end
+    return true
+end
+
+local function scrCycle()
+    if #scrIDCache == 0 then
+        local ok, err = scrRefill()
+        if not ok then return false, err end
+    end
+    local id = table.remove(scrIDCache)
+    scrInvN = #scrIDCache
+    local okU, ur = invokeT(function() return SCR_R:InvokeServer("UseCard", id) end, 8)
+    if not (okU and ur and ur.Success) then
+        pcall(function() SCR_R:InvokeServer("CancelScratch") end)
+        return false, (ur == "timeout" and "timeout" or "use")
+    end
+    local key = CFG.SCR_Card
+    plr:SetAttribute("ActiveCardType", key)
+    plr:SetAttribute("BlockVisualCashUpdate", true)
+    plr:SetAttribute("ScratchPercent", 1)
+    -- 4) rozliczenie BEZ rysowania (canvas to teatrzyk)
+    local okC, cr = invokeT(function() return SCR_R:InvokeServer("CompleteScratch") end, 8)
+    plr:SetAttribute("BlockVisualCashUpdate", false)
+    if not okC then
+        pcall(function() SCR_R:InvokeServer("CancelScratch") end)
+        return false, "complete"
+    end
+    local win = 0
+    if type(cr) == "table" then win = tonumber(cr.WinAmount) or 0 end
+    scrStats.n = scrStats.n + 1
+    scrStats.won = scrStats.won + win
+    if win > scrStats.big then scrStats.big = win end
+    return true, win
+end
+
+local function scratchLoop()
+    if scrBusy then return end
+    scrBusy = true
+    scrErr = 0
+    -- ubezpieczenie: gdyby wisiała niedokończona karta, serwer blokuje nowe UseCard
+    pcall(function() SCR_R:InvokeServer("CancelScratch") end)
+    refreshScr("start...")
+    while scrRunning do
+        if scrStats.n >= CFG.SCR_Limit then
+            refreshScr("limit " .. CFG.SCR_Limit .. " osiągnięty")
+            break
+        end
+        local ok, r = scrCycle()
+        if ok then
+            scrErr = 0
+            refreshScr("+" .. tostring(r) .. " zł (max " .. scrStats.big .. ")")
+        else
+            scrErr = scrErr + 1
+            refreshScr("ERR " .. tostring(r) .. " (" .. scrErr .. "/3)")
+            if tostring(r):find("buy") or scrErr >= 3 then break end -- brak kasy / 3 błędy z rzędu
+        end
+        task.wait(CFG.SCR_Tempo)
+    end
+    scrBusy = false
+    scrRunning = false
+    refreshScr("stop")
+end
+
+--// GŁÓWNA PĘTLA //--
+local function farmLoop()
+    if busy then return end
+    busy = true
+    stopReq = false
+    setNoclip(true)
+    setStatus("Skanuję butelki...", Color3.fromRGB(90, 180, 255))
+
+    while running and not stopReq do
+        local h = hrp()
+        if not h then
+            setStatus("Czekam na postać...", Color3.fromRGB(255, 170, 70))
+            task.wait(1)
+        else
+            local bottles = scanBottles()
+            local specN = 0
+            for _, b in ipairs(bottles) do
+                if (b.value or 0.5) > 0.5 then specN = specN + 1 end
+            end
+            count.Text = "  Butelki: " .. #bottles .. " (SPEC " .. specN .. ")  •  zebrano: " .. collectedTotal
+            if #bottles == 0 then
+                setStatus("Brak butelek — czekam na resp...", Color3.fromRGB(140, 148, 165))
+                hidePath()
+                task.wait(2)
+            else
+                local route = planRoute(bottles, h.Position)
+                drawPath(route, h.Position)
+                setStatus("Celów: " .. #route .. " • klaster R=" .. CFG.ClusterR, Color3.fromRGB(90, 180, 255))
+
+                for idx, entry in ipairs(route) do
+                    if not running or stopReq then break end
+                    if entry.model.Parent then
+                        h = hrp(); if not h then break end
+                        -- TWEEN nad butelkę (hover ≈2m, czyli w limicie fire)
+                        local target = entry.pos + Vector3.new(0, CFG.HoverH, 0)
+                        if (h.Position - target).Magnitude > CFG.ArriveRadius then
+                            setStatus("Lot " .. idx .. "/" .. #route, Color3.fromRGB(90, 180, 255))
+                            pcall(tweenTo, target)
+                        end
+                        if not running or stopReq then break end
+
+                        -- mikro-korekta gdyby fizyka zniosła (tween, nie TP)
+                        h = hrp()
+                        if h and (h.Position - entry.pos).Magnitude > CFG.ArriveRadius + 0.6 then
+                            pcall(tweenTo, entry.pos + Vector3.new(0, math.min(CFG.HoverH, 2), 0))
+                            h = hrp()
+                        end
+
+                        -- FIRE tylko gdy realnie blisko (twardy warunek 2m)
+                        h = hrp()
+                        if h and entry.model.Parent then
+                            local d2 = (h.Position - entry.pos).Magnitude
+                            if d2 <= CFG.ArriveRadius + 0.6 then
+                                setStatus("Zbieram " .. idx .. "/" .. #route, Color3.fromRGB(120, 220, 130))
+                                local okc = false
+                                for _ = 1, 3 do
+                                    if tryCollect(entry) then okc = true; break end
+                                    task.wait(0.1)
+                                    if not entry.model.Parent then
+                                        okc = true
+                                        collectedTotal = collectedTotal + 1
+                                        break
+                                    end
+                                end
+                                if okc then
+                                    count.Text = "  Butelki: " .. #scanBottles() .. "  •  zebrano: " .. collectedTotal
+                                end
+                                task.wait(CFG.Dwell)
+                            end
+                        end
+
+                        -- odśwież 2D co 10 celów (reszta trasy) + ewentualna sprzedaż
+                        if idx % 10 == 0 then
+                            local fresh = {}
+                            for j = idx + 1, #route do
+                                if route[j].model.Parent then fresh[#fresh + 1] = route[j] end
+                            end
+                            drawPath(fresh)
+                            -- próg na PLECAK (nie licznik): burst-zbiory też lądują w toolse
+                            if CFG.AutoSell and countTools() >= CFG.SellEvery then
+                                goSell()
+                            end
+                        end
+                    end -- if entry.model.Parent
+                end
+                count.Text = "  Butelki: " .. #scanBottles() .. "  •  zebrano: " .. collectedTotal
+                if CFG.AutoSell and countTools() >= CFG.SellEvery then
+                    goSell() -- 500 w plecaku: sprzedaż i powrót, potem re-skan
+                end
+                task.wait(0.3) -- re-skan po pełnym obiegu (respawn butelek)
+            end
+        end
+    end
+
+    setNoclip(false)
+    pcall(function() local hh = hrp() if hh then hh.Anchored = false end end) -- na pewno odkotwicz
+    if currentTween then pcall(function() currentTween:Cancel() end); currentTween = nil end
+    hidePath()
+    busy = false
+    if stopReq then setStatus("STOP — zebrano: " .. collectedTotal, Color3.fromRGB(255, 120, 120)) end
+end
+
+startB.MouseButton1Click:Connect(function()
+    if running then return end
+    if not Workspace:FindFirstChild("Butelki") then
+        setStatus("Brak folderu Butelki!", Color3.fromRGB(255, 120, 120))
+        return
+    end
+    running = true
+    setStatus("START...", Color3.fromRGB(120, 220, 130))
+    task.spawn(farmLoop)
+end)
+
+stopB.MouseButton1Click:Connect(function()
+    stopReq = true
+    running = false
+    setStatus("STOP...", Color3.fromRGB(255, 120, 120))
+end)
+
+closeB.MouseButton1Click:Connect(function()
+    running = false; stopReq = true
+    setNoclip(false)
+    if currentTween then pcall(function() currentTween:Cancel() end) end
+    hidePath()
+    gui:Destroy()
+end)
+
+plr.CharacterAdded:Connect(function()
+    task.wait(1)
+    if running and not busy then task.spawn(farmLoop) end
+end)
+
+setStatus("Gotowy — ustaw suwaki i kliknij START")
+count.Text = "  Butelki: " .. #scanBottles() .. "  •  zebrano: 0"
+
+-- haki do sterowania / diagnostyki z konsoli executora (getgenv działa między wywołaniami)
+getgenv().BF_GO = function()
+    if running then return "already" end
+    running = true
+    task.spawn(farmLoop)
+    return "started"
+end
+getgenv().BF_STOP = function()
+    stopReq = true
+    running = false
+    return "stopped"
+end
+getgenv().BF_STAT = function()
+    return { running = running, busy = busy, got = collectedTotal, n = #scanBottles() }
+end
+getgenv().BF_SELLN = function(n)
+    CFG.SellEvery = n
+    return n
+end
+getgenv().BF_SCRGO = function()
+    if scrRunning then return "already" end
+    scrRunning = true
+    task.spawn(scratchLoop)
+    return "started"
+end
+getgenv().BF_SCRSTOP = function()
+    scrRunning = false
+    return "stopped"
+end
+getgenv().BF_SCRSTAT = function()
+    return { run = scrRunning, n = scrStats.n, cost = scrStats.cost, won = scrStats.won, big = scrStats.big, eq = scrInvN, card = CFG.SCR_Card }
+end
+getgenv().BF_CARD = function(k)
+    for i, key in ipairs(CARDS) do
+        if key == k then CARDI = i CFG.SCR_Card = k refreshCard() return k end
+    end
+    return nil
+end
+getgenv().BF_AF = function()
+    return antiConn ~= nil
+end
+-- pierwsze N celów trasy (do weryfikacji priorytetu): zwraca typy, np. {"zlota",...}
+getgenv().BF_PEEK = function(n)
+    local h = hrp()
+    if not h then return {} end
+    local r = planRoute(scanBottles(), h.Position)
+    local o = {}
+    for i = 1, math.min(n or 5, #r) do o[#o + 1] = r[i].btype or "?" end
+    return o
+end
